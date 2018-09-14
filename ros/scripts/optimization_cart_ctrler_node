@@ -1,0 +1,6 @@
+#!/usr/bin/env python
+
+import mbot_optimization_cartesian_controller_ros.optimization_cart_ctrler
+
+if __name__ == '__main__':
+ mbot_optimization_cartesian_controller_ros.optimization_cart_ctrler.main()

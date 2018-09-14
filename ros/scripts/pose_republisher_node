@@ -1,0 +1,6 @@
+#!/usr/bin/env python
+
+import mbot_optimization_cartesian_controller_ros.pose_republisher
+
+if __name__ == '__main__':
+ mbot_optimization_cartesian_controller_ros.pose_republisher.main()

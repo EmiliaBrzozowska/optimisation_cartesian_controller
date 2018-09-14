@@ -1,0 +1,5 @@
+# python precompiled code
+*.pyc
+
+# kate text editor autom generated temp bkp files
+.kate-swp

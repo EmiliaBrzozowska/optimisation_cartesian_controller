@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package>
+    <name>mbot_optimization_cartesian_controller</name>
+    <version>1.0.0</version>
+
+    <description>
+        Offers a cartesian controller in 10 degrees of freedom for 7 arm joints + base.
+        It moves base and arm in a combined way to achive 3D poses with the manipulator end effector.
+    </description>
+
+    <license>GPLv3</license>
+
+    <author email="emiliabrzozowska10788@gmail.com">Emilia Brzozowska</author>
+    <maintainer email="emiliabrzozowska10788@gmail.com">Emilia Brzozowska</maintainer>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <run_depend>rospy</run_depend>
+    <run_depend>std_msgs</run_depend>
+    <run_depend>sensor_msgs</run_depend>
+    <run_depend>geometry_msgs</run_depend>
+    <run_depend>tf</run_depend>
+
+</package>

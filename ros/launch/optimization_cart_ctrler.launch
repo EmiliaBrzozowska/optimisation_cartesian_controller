@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<launch>
+
+    <!-- NOTE: This is an example launch file, please do not modify -->
+
+    <!-- optimization based cartesian controller to achieve 3D poses with end effector moving arm + base combined -->
+
+    <!-- weights for mbot base, set to a high value (e.g. 100) to prevent movement -->
+    <arg name="base_x_weight" default="4" />
+    <arg name="base_y_weight" default="4" />
+    <arg name="base_theta_weight" default="8" />
+    <arg name="node_name" default="optimization_cart_ctrler_node" />
+
+    <!-- set where to publish cmd_vel commands -->
+    <arg name="cmd_vel_topic" default="/cmd_vel" />
+
+    <!-- set target pose to be achieved by controller -->
+    <arg name="target_pose" default="/mir_manipulation/pregrasp_planner_pipeline/target_pose" />
+
+    <!-- the topics where velocity commands will be published -->
+    <arg name="joint_cmd_vel0" default="/left_arm_joint0_velocity_controller/command" />
+    <arg name="joint_cmd_vel1" default="/left_arm_joint1_velocity_controller/command" />
+    <arg name="joint_cmd_vel2" default="/left_arm_joint2_velocity_controller/command" />
+    <arg name="joint_cmd_vel3" default="/left_arm_joint3_velocity_controller/command" />
+    <arg name="joint_cmd_vel4" default="/left_arm_joint4_velocity_controller/command" />
+    <arg name="joint_cmd_vel5" default="/left_arm_joint5_velocity_controller/command" />
+    <arg name="joint_cmd_vel6" default="/left_arm_joint6_velocity_controller/command" />
+
+    <node pkg="mbot_optimization_cartesian_controller" type="optimization_cart_ctrler_node" name="$(arg node_name)"
+          output="screen" >
+
+        <remap from="~joint_cmd_vel0" to="$(arg joint_cmd_vel0)" />
+        <remap from="~joint_cmd_vel1" to="$(arg joint_cmd_vel1)" />
+        <remap from="~joint_cmd_vel2" to="$(arg joint_cmd_vel2)" />
+        <remap from="~joint_cmd_vel3" to="$(arg joint_cmd_vel3)" />
+        <remap from="~joint_cmd_vel4" to="$(arg joint_cmd_vel4)" />
+        <remap from="~joint_cmd_vel5" to="$(arg joint_cmd_vel5)" />
+        <remap from="~joint_cmd_vel6" to="$(arg joint_cmd_vel6)" />
+
+        <!-- publish base velocities in low priority to be able to override by joystick -->
+        <remap from="~cmd_vel_pub" to="$(arg cmd_vel_topic)" />
+
+        <remap from="~target_pose" to="$(arg target_pose)" />
+
+        <!-- base weights for the controller -->
+        <param name="base_x_weight" value="$(arg base_x_weight)" />
+        <param name="base_y_weight" value="$(arg base_y_weight)" />
+        <param name="base_theta_weight" value="$(arg base_theta_weight)" />
+    </node>
+
+</launch>

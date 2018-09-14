@@ -1,0 +1,598 @@
+#!/usr/bin/env python
+
+# ros imports
+import rospy
+import tf
+from geometry_msgs.msg import PoseStamped, TwistStamped, Twist
+from std_msgs.msg import String, Float64
+from sensor_msgs.msg import JointState
+
+# ros independent imports
+import math
+import PyKDL
+import time
+import numpy as np
+import numpy.linalg as la
+from urdf_parser_py.urdf import URDF
+from kdl_parser_py.urdf import treeFromUrdfModel
+from scipy.optimize import minimize
+from scipy.optimize import fmin_slsqp
+
+class ArmController(object):
+    '''
+    Inputs: tf - current end-effector pose (positon + rotation)
+            goal end-effector pose
+            phi(7x1) - current joint angles state
+
+    Output: Publishes cartesian velocity for end-effector
+    '''
+    def __init__(self):
+        # choose between real robot and simulator
+        self.real_robot = True  # real robot
+        #self.real_robot = False # sim robot
+        self.wait_for_transform = 0.1
+        self.listener = tf.TransformListener()
+        self.listener2 = tf.TransformListener() #creating tf.TransformListener object
+        self.turn_condition = 10
+        self.turn_penalty = 0      
+        self.double_pi = 2.0 * math.pi
+        self.Table_flag = False
+        self.joint_msg = JointState() # to store angles
+        self.base_vel_msg = Twist()  # to store base Twist message
+        # subscribe to current joint angles
+        rospy.Subscriber('joint_states', JointState, self.JointStateCallback, queue_size=1)
+        self.goalpose_msg = PoseStamped() #to store goal pose
+        self.goalpose_msg1 = PoseStamped()
+        self.goalpose_msg_odom = PoseStamped()
+        self.base_to_odom = None
+        # subscribe to (goal pose) (Type: geometry_msgs/PoseStamped)
+        rospy.Subscriber('~target_pose', PoseStamped, self.ObjectCallback, queue_size=1)
+        rospy.Subscriber('/cmd_vel', Twist, self.CmdVelCallback, queue_size=1)
+
+        # to trigger the node and start the controller
+        rospy.Subscriber("~event_in", String, self.eventInCallback, queue_size=1)
+        self.pub_event_out = rospy.Publisher('~event_out', String, queue_size=1)
+        self.running = False
+
+        # to publish joint velocities
+        self.pub_vel0 = rospy.Publisher('~joint_cmd_vel0', Float64, queue_size=1)
+        self.pub_vel1 = rospy.Publisher('~joint_cmd_vel1', Float64, queue_size=1)
+        self.pub_vel2 = rospy.Publisher('~joint_cmd_vel2', Float64, queue_size=1)
+        self.pub_vel3 = rospy.Publisher('~joint_cmd_vel3', Float64, queue_size=1)
+        self.pub_vel4 = rospy.Publisher('~joint_cmd_vel4', Float64, queue_size=1)
+        self.pub_vel5 = rospy.Publisher('~joint_cmd_vel5', Float64, queue_size=1)
+        self.pub_vel6 = rospy.Publisher('~joint_cmd_vel6', Float64, queue_size=1)
+        self.pub_base_vel_twist = rospy.Publisher('~cmd_vel_pub', Twist, queue_size=1)
+
+        self.vel_joint0 = Float64() # the msg to publish velocities
+        self.vel_joint1 = Float64()
+        self.vel_joint2 = Float64()
+        self.vel_joint3 = Float64()
+        self.vel_joint4 = Float64()
+        self.vel_joint5 = Float64()
+        self.vel_joint6 = Float64()
+        self.vel_base = Twist()
+        self.vel_twist_stamped_jac = TwistStamped()
+        self.vel_twist_stamped_lin = TwistStamped()
+        self.vel_twist_stamped_now = TwistStamped()
+        self.vel_twist_stamped_opt = TwistStamped()
+
+        self.goalpose_received = False # flag to indicate that a goal pose msg was received
+        self.joint_received = False # flag to indicate that a joint statese msg was received
+        self.base_vel_received = False # flag to indicate that a base vel msg was received
+        self.translation = None
+        self.rotation = None
+        self.phi = None
+        self.current_phi_vel = None
+        self.current_base_vel = [0,0,0] #x,y,theta
+        self.vel = [0,0,0] #ee desired linear velocity
+        self.ang_vel =[0,0,0] #roll,pitch,yaw, ee desired angular velocity
+        self.x1 = [0,0,0,0,0,0,0,0,0,0] #initial conditions for optimization - servos velocities phi' (7x1) + base = (10x1)
+        self.robot = URDF.from_parameter_server('robot_description')
+        self.tree = treeFromUrdfModel(self.robot)[1]  #tupel error before
+        #self.joint_names = self.getJointsNames()
+        self.joint_names = ['left_arm_joint0', 'left_arm_joint1', 'left_arm_joint2',\
+                            'left_arm_joint3', 'left_arm_joint4', 'left_arm_joint5', 'left_arm_joint6']
+        self.chain = self.tree.getChain("base_link", "left_arm_virtual_endeffector")
+        self.num_joints = self.chain.getNrOfJoints()
+        self.jac_kdl = PyKDL.ChainJntToJacSolver(self.chain)
+        self.b = (-0.2,0.2)#bounds for arm servos - veocities limits same for all 7 joints 
+        self.base = (-0.3,0.3) #and 3 for base
+        self.bnds = (self.b,self.b,self.b,self.b,self.b,self.b,self.b,self.base,self.base,self.b)
+        self.con1 = {'type':'eq','fun':self.constraint1}
+        self.con2 = {'type':'ineq','fun':self.constraint_min}
+        self.con3 = {'type':'ineq','fun':self.constraint_max}
+        self.cons = [self.con2,self.con3] #self.con1,
+        self.p_prim1 = None
+        self.solex = [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+        # flag to know when to start, based upon required tf msg
+        self.ready_to_start = False
+        # query weight params from param server
+        self.base_x_weight = rospy.get_param('~base_x_weight', 4)
+        self.base_y_weight = rospy.get_param('~base_y_weight', 4)
+        self.base_theta_weight = rospy.get_param('~base_theta_weight', 8)
+
+
+    def optimize(self):
+        if self.phi is None:
+            return
+        self.get_tf_endeffector()
+        self.jacobian_matrix = np.asarray(self.jacobian())
+        t_before = time.time()
+        variable = np.concatenate((self.current_phi_vel, self.current_base_vel), axis=0)
+        #read current_base_vel from the topic 
+        self.sol = minimize(self.objective, variable, method = 'SLSQP', constraints = self.cons ,bounds = self.bnds)
+        self.solex = self.sol.x
+        t_after = time.time()
+        t_diff = t_after - t_before
+        if not self.sol.success:
+            # print "FAILED minimization\n", self.sol.message
+            print self.sol.message
+            self.vel_joint0 = 0.0
+            self.vel_joint1 = 0.0
+            self.vel_joint2 = 0.0
+            self.vel_joint3 = 0.0
+            self.vel_joint4 = 0.0
+            self.vel_joint5 = 0.0
+            self.vel_joint6 = 0.0
+            self.vel_base.linear.x = 0.0
+            self.vel_base.linear.y = 0.0
+            self.vel_base.linear.z = 0.0
+            self.vel_base.angular.x = 0.0 
+            self.vel_base.angular.y = 0.0
+            self.vel_base.angular.z = 0.0
+
+        elif (self.calc_ee_lin_vel().all() == 0) and (self.calc_ee_ang_vel().all() == 0):
+            rospy.loginfo('oooooooooo POSE REACHED oooooooooo')
+            self.running = False
+            self.pub_event_out.publish(String('e_success'))
+
+            self.vel_joint0 = 0.0
+            self.vel_joint1 = 0.0
+            self.vel_joint2 = 0.0
+            self.vel_joint3 = 0.0
+            self.vel_joint4 = 0.0
+            self.vel_joint5 = 0.0
+            self.vel_joint6 = 0.0
+            self.vel_base.linear.x = 0.0
+            self.vel_base.linear.y = 0.0
+            self.vel_base.linear.z = 0.0
+            self.vel_base.angular.x = 0.0 
+            self.vel_base.angular.y = 0.0
+            self.vel_base.angular.z = 0.0
+
+        else:
+            rospy.logdebug('Cost: %f'% self.sol.fun)
+            # print "solution:", self.sol.x
+            self.vel_joint0 =self.sol.x[0]
+            self.vel_joint1 =self.sol.x[1]
+            self.vel_joint2 =self.sol.x[2]
+            self.vel_joint3 =self.sol.x[3]
+            self.vel_joint4 =self.sol.x[4]
+            self.vel_joint5 =self.sol.x[5]
+            self.vel_joint6 =self.sol.x[6]
+            self.vel_base.linear.x = self.sol.x[7] 
+            self.vel_base.linear.y = self.sol.x[8]
+            self.vel_base.linear.z = 0.0
+            self.vel_base.angular.x = 0.0 
+            self.vel_base.angular.y = 0.0
+            self.vel_base.angular.z = self.sol.x[9]  
+                
+        # publishing Float64 msgs - velocity for each joint separately 
+        self.pub_vel0.publish(self.vel_joint0)
+        self.pub_vel1.publish(self.vel_joint1)
+        self.pub_vel2.publish(self.vel_joint2)
+        self.pub_vel3.publish(self.vel_joint3)
+        self.pub_vel4.publish(self.vel_joint4)
+        self.pub_vel5.publish(self.vel_joint5)
+        self.pub_vel6.publish(self.vel_joint6)
+        self.pub_base_vel_twist.publish(self.vel_base)
+
+
+############ CALLBACKS ############
+
+    def eventInCallback(self, msg):
+        '''
+        callback that gets triggered if you receive a msg on event_in topic
+        this means the user wants to either start or stop the controller
+        '''
+        if msg.data == 'e_start':
+            self.running = True
+            self.Table_flag = False
+            self.pub_event_out.publish(String('e_started'))
+        elif msg.data == 'e_stop':
+            # send 0 velocities to the 6 arm joints
+            self.stop_arm()
+            # provide feedback to user
+            self.running = False
+            self.ready_to_start = False
+            self.pub_event_out.publish(String('e_failure'))
+        else:
+            rospy.logerr('event not supported, admisible values are : e_start, e_stop')
+
+
+    def ObjectCallback(self, msg):
+        '''
+        This function get executed every time you receive a goal pose message
+        '''
+        # ensure that the code gets executed from beginning to end one time completely
+        while not rospy.is_shutdown():
+            try:
+                # refresh the timestamp of the received pose
+                msg.header.stamp = rospy.Time.now() - rospy.Duration(0.0025) # hack
+                # wait for transform to become availble
+                self.listener2.waitForTransform("odom","base_link",msg.header.stamp,\
+                                                rospy.Duration(self.wait_for_transform))
+                base_to_odom = self.listener2.lookupTransform("odom","base_link",msg.header.stamp)
+                if base_to_odom:
+                    self.base_to_odom = base_to_odom
+                    self.goalpose_msg_odom = self.listener2.transformPose('odom',msg)
+                    self.goalpose_msg = self.listener2.transformPose('base_link',msg) #goal pose in reference to base_link
+                    self.ready_to_start = True
+                    break
+            except:
+                pass
+                #rospy.logwarn ('Exception while transforming goal pose')
+
+        self.goalpose_received = True
+        # print ("goal pose received:", self.goalpose_msg)
+        return
+
+            
+    def restrict_angle (self, angle):
+        '''
+        Restrict angle between -180 < ang < 180
+        input:
+            angle - any angle in radians
+        output:
+            a restricted angle on the range (-pi to pi)
+        e.g:
+            angle = 190, should be replace by -170 (e.g. is given in deg but happens in rads)
+            angle = -190, should be replace by 170 (e.g. is given in deg but happens in rads)
+        '''
+        while angle > math.pi:
+            angle = angle - self.double_pi
+
+        while angle < -math.pi:
+            angle = angle + self.double_pi
+
+        return angle
+
+
+    def JointStateCallback(self, msg):
+        '''
+        This function get executed every time you receive joint angles message
+        '''
+        self.joint_msg = msg
+        self.joint_received = True
+        if self.real_robot:
+            self.phi = np.array(self.joint_msg.position[0:7])
+            self.current_phi_vel = np.array(self.joint_msg.velocity[0:7])
+        else:
+            self.phi = np.array(self.joint_msg.position[5:12])
+            self.current_phi_vel = np.array(self.joint_msg.velocity[5:12])
+        return self.phi
+
+
+    def CmdVelCallback(self, msg):
+        '''
+        This function get executed every time you receive a cmd_base Twist message
+        '''
+        self.base_vel_msg = msg
+        self.current_base_vel = np.array([msg.linear.x,msg.linear.y,msg.angular.z])
+        self.base_vel_received = True
+        # print ("current goal base velocity received:", self.base_vel_msg)
+        return
+
+############ PYKDL JACOBIAN ############
+
+    def joints_to_kdl(self,values,type = 'positions'):
+        '''
+
+        '''
+        kdl_array = PyKDL.JntArray(self.num_joints)
+        for idx, name in enumerate(self.joint_names):
+            kdl_array[idx] = values[idx]
+        if type == 'velocities':
+            kdl_array = PyKDL.JntArrayVel(kdl_array)
+        return kdl_array
+
+
+    def kdl_to_mat(self, data):
+        '''
+        Parsing Jacobian object data/string type to matrix
+        '''
+        mat =  np.mat(np.zeros((data.rows(), data.columns())))
+        for i in range(data.rows()):
+            for j in range(data.columns()):
+                mat[i,j] = data[i,j]
+        return mat
+
+
+    def jacobian(self):
+        '''
+        Calculates jacobian based on joint values - argument to pass ( to do )
+        '''
+        joint_values = self.phi
+        jacobian = PyKDL.Jacobian(self.num_joints)
+        self.jac_kdl.JntToJac(self.joints_to_kdl(joint_values), jacobian)  #changes jacobian to self.jac_matrix
+        temp = jacobian
+        return self.kdl_to_mat(temp)
+
+############ SCIPY OPTIMISATION ############
+
+    def objective(self,x):
+        '''
+        Defines cost function:  
+        Arm only : ||Pg - Pc + delta_t * p'||  where p' = J(phi)*phi' TO CORRECT
+        Arm + Base : 
+        '''
+        lin_vel = self.calc_ee_lin_vel()
+        
+        # give priority to z
+        multiplier = 3
+        lin_vel = np.array([lin_vel[0], lin_vel[1], lin_vel[2]*multiplier])
+        
+        ang_vel = 5*self.calc_ee_ang_vel()
+        vel_vector6 =np.concatenate((lin_vel,ang_vel), axis=0)
+
+        jacobian = self.jacobian_matrix
+        p_prim = np.dot(jacobian,x[0:7])
+        self.p_prim1 = p_prim
+
+        # only arm controller
+        #temp = vel_vector6 - p_prim
+        #array of weights:
+        weights = np.array([0.03,0.025,0.025,0.02,0.15,0.01,0.001, self.base_x_weight, self.base_y_weight, self.base_theta_weight])
+        # arm + base controller
+        temp = vel_vector6-(p_prim+np.array([x[7],x[8],0,0,0,x[9]])+np.array([-x[9]*self.translation[1],x[9]*self.translation[0],0,0,0,0]))        
+        weight = 100 #weight for cost function
+        result = weight * np.dot(temp,temp) +  np.sum(weights*abs(x)) #+ 0.05*self.base_rot_penalty(x) + self.min_max_log(x)
+        return result/50
+
+
+    def min_max_log(self,x):
+        '''
+        #Defines penalty function for getting close to angle limits.
+        #To change speed of penalty function modify alpha, to change limits modify phi_LOW/phi_HIGH.
+        ''' 
+        t = 0.1 #delta t
+        alpha = 0.25    
+
+        #phi_LOW  = np.array([-0.8,      -0.8,      -0.8,    -0.8,      -0.8,      -0.8,      -2.5])
+        phi_LOW  = np.array([-0.1,      -0.1,      -0.1,    -0.1,      -0.1,      -0.1,      -2.5])
+        phi_MIN  = np.array([-2.55091,  -1.7071,   -1.54591,-1.60721,  -1.87571,  -1.57661,  -2.52791])
+        #phi_HIGH = np.array([ 0.8,       0.8,       0.8,     0.8,       0.8,       0.8,       2.5])
+        phi_HIGH = np.array([ 0.1,       0.1,       0.1,     0.1,       0.1,       0.1,       2.5])
+        phi_MAX  = np.array([ 2.55851,   1.63791,   1.731,   1.61491,   1.46151,   1.53821,   2.53551])
+
+        result_low = np.zeros(7)
+        result_high = np.zeros(7)
+        f_min = np.zeros(7)
+        f_max = np.zeros(7)
+        #current_phi = self.phi
+        current_phi = np.array([0,0,0,0,0,0,0])
+
+        for i in range (0,7):
+            current_phi[i] = self.phi[i] + self.solex[i] * t
+
+            if current_phi[i] > phi_LOW[i] and current_phi[i] < phi_HIGH[i]:
+                # print "000 000 CONDITION"
+                f_min[i] = 0
+                f_max[i] = 0
+
+            elif current_phi[i] < phi_LOW[i]:
+                # print "XXX MIN CONDITION",i, current_phi[i] - phi_MIN[i]
+                # print "current_phi", current_phi[i], "phi MIN",phi_MIN[i]
+                f_min[i] = -alpha*math.log(current_phi[i] - phi_MIN[i] + 0.02) +0.1
+                f_max[i]  = 0
+
+            elif current_phi[i] > phi_HIGH[i]:
+                # print  "YYY MAX CONDITION",i, -current_phi[i] + phi_MAX[i]
+                # print "current_phi", current_phi[i], "phi MAX",phi_MAX[i]
+                f_min[i] = 0
+                f_max[i] = -alpha*math.log(-current_phi[i] + phi_MAX[i] + 0.02) + 0.1
+
+            else:
+                rospy.logerr('Error: Check logaritmic penalty function conditions')
+
+            result_low[i] = f_min[i]
+            result_high[i] = f_max[i]
+
+        penalty = la.norm(result_low) + la.norm(result_high)
+        return penalty
+        
+
+    def base_rot_penalty(self,x):
+        #base linear velocities 
+
+        b_v_x = x[7]
+        b_v_y = x[8]
+        b_v_r = x[9]
+ 
+        t = 0.1 #delta t
+
+        #base pose in respect to odom transform 
+        base_to_odom_yaw = tf.transformations.euler_from_quaternion(self.base_to_odom[1])[2]
+        base_x = self.base_to_odom[0][0]
+        base_y = self.base_to_odom[0][1]
+
+        #goal pose in respect to odom transform 
+        goal_x = self.goalpose_msg_odom.pose.position.x
+        goal_y = self.goalpose_msg_odom.pose.position.y
+
+        #how much robot needs to turn to face the object
+        self.turn_condition = self.restrict_angle(math.atan2((goal_y-(base_y + t*b_v_y)),
+                             (goal_x-(base_x + t * b_v_x))) -(base_to_odom_yaw + t*b_v_r))
+        # print math.degrees(self.turn_condition)
+        alpha = 25
+        temp =  abs(math.degrees(self.turn_condition)) #(0-180)
+        penalty = -alpha*math.log(-temp + 180 + 1) + 128
+        return penalty
+
+
+    def constraint1(self,x):
+        '''
+        Defines equality constraint = 0
+        '''
+        #this constraint is not valid (is already included in cost function)
+        endeffector_vel = self.calc_ee_lin_vel()
+        jacobian = self.jacobian()
+
+        p_prim = [0,0,0,0,0,0]  # v_x, v_y, v_z, omega_x, omega_y, omega_z
+        p_prim [0] = endeffector_vel[0] # pass v_x
+        p_prim [1] = endeffector_vel[1] # pass v_y
+        p_prim [2] = endeffector_vel[2] # pass v_z
+        temp = p_prim - np.dot(jacobian,x)
+        temp = temp.T
+        final = la.norm(temp) #normalization
+        return final
+
+
+    def constraint_min(self,x):
+        '''
+        Defines inequality constraint > 0
+        '''
+        #joints 0-7 - MIN angle
+        min_angle = np.array([-2.5509,-1.707,-1.5459,-1.6072,-1.8757,-1.5766,-2.5279])
+        delta_t =  self.wait_for_transform #in [s]
+        inequality_min = self.phi + delta_t * x[0:7] - min_angle
+        return inequality_min
+
+
+    def constraint_max(self,x):
+        '''
+        Defines inequality constraint > 0
+        '''
+        #joints 0-7 - MAX angle
+        max_angle = np.array([2.5585,1.6379,1.73,1.6149,1.4615,1.5382,2.5355])
+        delta_t =  self.wait_for_transform #in [s]
+        inequality_max = max_angle - self.phi - delta_t * x[0:7]
+        return inequality_max
+
+############ CONTROLLER DATA ############
+
+    def get_tf_endeffector(self):
+        '''
+        Query tf to get the endeffector(joint6) pose in reference to base_link
+        '''
+        while not rospy.is_shutdown():
+            try:
+                #wait for transform to become availble  ____________________rospy.Time.now ?
+                self.listener.waitForTransform("base_link","left_arm_virtual_endeffector",rospy.Time(0),\
+                                                rospy.Duration(self.wait_for_transform))
+                (translation, rotation) = self.listener.lookupTransform("base_link","left_arm_virtual_endeffector", rospy.Time(0))
+                break
+            except tf.Exception, error:
+                rospy.logwarn ("Exception occured: {0}".format(error))
+
+        #self.lock_scan = True
+        self.translation = translation
+        self.rotation = rotation
+
+        return
+
+
+    def calc_ee_lin_vel(self):
+        '''
+        inputs: current position, goal position
+        output: linear velocity vector to reach the goal position
+        '''
+        self.get_tf_endeffector() # get newest translation and rotation
+        goal_position = np.array([self.goalpose_msg.pose.position.x, self.goalpose_msg.pose.position.y,\
+                         self.goalpose_msg.pose.position.z])
+        # print "goal_pos", goal_position
+        current_position = np.array(self.translation)
+        # print "current_position", current_position
+
+        v = 0.2  # constant speed [m/s]
+        du = goal_position - current_position # position error vector 3x1
+        d = la.norm(du) # normalization
+
+        position_offset = 0.02 # spherical offset [m]
+        
+        if abs(d) > position_offset:
+            vel = du/d*v
+        else:
+            vel = np.zeros(3)
+        return vel
+
+
+    def calc_ee_ang_vel(self):
+        '''
+        inputs: current rotation, goal rotation
+        output: angular velocity vector to reach the goal rotation
+        '''
+        # orientation could be harcoded here, but better to harcode this orientation from the sender
+        #goal_rot_quat = np.array([[0.541, -0.507, -0.468, 0.481]])
+
+        goal_rot_quat = np.array([self.goalpose_msg.pose.orientation.x, self.goalpose_msg.pose.orientation.y,\
+                              self.goalpose_msg.pose.orientation.z, self.goalpose_msg.pose.orientation.w])
+        
+        # print "goal rot quat", goal_rot_quat
+        curr_rot_quat = self.rotation
+        Rot_matrix_goal = tf.transformations.quaternion_matrix(goal_rot_quat)
+        Rot_matrix_curr = tf.transformations.quaternion_matrix(curr_rot_quat)
+
+
+        rot_error = np.dot(Rot_matrix_goal,Rot_matrix_curr.T)[0:3,0:3]
+        # print "rot_e:",rot_error
+
+        trace_rot =  rot_error[0][0] + rot_error[1][1] + rot_error[2][2]
+        formula = (trace_rot - 1)*0.5
+        theta = np.arccos(np.clip(formula,-1,1)) #-1.3964792167 invalid value for arccos
+
+        scalar = 0.5* np.sin(theta)
+        vector = np.array([rot_error[2][1]-rot_error[1][2],rot_error[0][2]-rot_error[2][0],rot_error[1][0]-rot_error[0][1]])
+        omega = scalar*vector
+        v = 0.05 #[rad/s]
+        d = la.norm(omega) #normalization ?
+        d1 = 1 #skipping normalization
+        orientation_offset = 0.1 #tolerance [rad?], 0.1rad = 5.7 degrees
+        if abs(d) > orientation_offset:
+            ang_vel = omega/d1*v
+        else:
+            ang_vel = np.zeros(3)
+        return ang_vel
+
+
+    def stop_arm(self):
+        self.vel_joint0 = 0.0
+        self.vel_joint1 = 0.0
+        self.vel_joint2 = 0.0
+        self.vel_joint3 = 0.0
+        self.vel_joint4 = 0.0
+        self.vel_joint5 = 0.0
+        self.vel_joint6 = 0.0
+        self.pub_vel0.publish(Float64(0.0))
+        self.pub_vel1.publish(Float64(0.0))
+        self.pub_vel2.publish(Float64(0.0))
+        self.pub_vel3.publish(Float64(0.0))
+        self.pub_vel4.publish(Float64(0.0))
+        self.pub_vel5.publish(Float64(0.0))
+        self.pub_vel6.publish(Float64(0.0))
+        zero_base = Twist()
+        zero_base.linear.x = 0.0
+        zero_base.linear.y = 0.0
+        zero_base.linear.z = 0.0
+        zero_base.angular.x = 0.0 
+        zero_base.angular.y = 0.0
+        zero_base.angular.z = 0.0
+        self.pub_base_vel_twist.publish(zero_base)
+
+
+    def start_loop_arm_controller(self):
+        '''
+        main loop
+        '''
+        r = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            if self.ready_to_start:
+                if self.running:
+                    self.optimize()
+            r.sleep()
+
+def main():
+    rospy.init_node('optimization_cart_ctrler', anonymous=False)
+    closed_loop_arm_controller = ArmController()
+    closed_loop_arm_controller.start_loop_arm_controller()
