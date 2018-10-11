@@ -6,7 +6,7 @@ It offers a cartesian controller in x degrees of freedom (x = 10 for our use cas
 
 It moves base and arm in a combined way to achive 3D poses with the end effector.
 
-A nice video showing some results can be seen under [ISR](https://www.youtube.com/watch?v=_-M7cxlhyYY&t=38s).
+A nice video showing some results can be seen [here](https://www.youtube.com/watch?v=_-M7cxlhyYY&t=38s).
 
 # Credits
 
@@ -38,7 +38,7 @@ run the controller:
 
 publish pose stamped message as goal pose:
 
-        rostopic pub /my_goal_pose std_msgs/PoseStamped ... (odom frame!)
+        rostopic pub /my_goal_pose std_msgs/PoseStamped ... (base_link frame!)
 
 trigger node to start controller:
 
